@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Cover Launcher</string>
+    <string name="notif_channel">Cover Launcher</string>
+    <string name="no_notifications">Không có thông báo</string>
+    <string name="close_all">Đóng tất cả</string>
+    <string name="closed_fmt">Đã đóng %d app</string>
+    <string name="nothing_to_close">Không có app nào</string>
+    <string name="close_failed">Lỗi (root?)</string>
+    <string name="notif_title">Cover Launcher đang chạy</string>
+    <string name="notif_text">Vuốt từ mép trái/phải vào: Quay lại · Vuốt từ mép dưới lên: Màn hình chính</string>
+</resources>
