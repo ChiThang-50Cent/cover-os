@@ -11,6 +11,22 @@ adb shell appops set $PKG SYSTEM_ALERT_WINDOW allow
 adb shell pm grant $PKG android.permission.POST_NOTIFICATIONS
 adb shell "su -c 'dumpsys deviceidle whitelist +$PKG'" >/dev/null
 adb shell "su -c 'cmd notification allow_listener $PKG/$PKG.NotifService'"
+
+# Update the boot-persistent watchdog, then start exactly one independent instance.
+adb push root-watchdog.sh /data/local/tmp/cover-root-watchdog.sh >/dev/null
+adb shell "su -c '
+    set -e
+    mkdir -p /data/adb/service.d /data/adb/cover-launcher
+    chmod 700 /data/adb/cover-launcher
+    if [ -x /data/adb/service.d/cover-launcher.sh ]; then
+        /data/adb/service.d/cover-launcher.sh --stop
+    fi
+    cp /data/local/tmp/cover-root-watchdog.sh /data/adb/service.d/cover-launcher.sh
+    chmod 700 /data/adb/service.d/cover-launcher.sh
+    rm -f /data/local/tmp/cover-root-watchdog.sh
+    /data/adb/service.d/cover-launcher.sh
+'"
+
 adb shell am start -n $PKG/.StartActivity
 
 cat <<EOF

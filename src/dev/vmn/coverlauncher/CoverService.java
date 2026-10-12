@@ -11,12 +11,17 @@ import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.SystemClock;
+import android.util.AtomicFile;
 import android.util.Log;
 import android.view.Display;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -33,14 +38,16 @@ public final class CoverService extends Service implements DisplayManager.Displa
     private static final String STOCK_HOME = "com.android.systemui.subscreen.SubHomeActivity";
     private static final Pattern EVENT_COMPONENT = Pattern.compile("\\[-?\\d+,([^,\\]]+),"); // [token,component,reason]
     private static final Pattern COMPONENT_IN_EVENT = Pattern.compile("[A-Za-z0-9._]+/([.A-Za-z0-9._$]+)"); // pkg/Class
+    private static final Pattern TOP_STOCK_HOME = Pattern.compile(
+            "topResumedActivity=ActivityRecord\\{[^\\n]*com\\.android\\.systemui/(?:\\.subscreen\\.SubHomeActivity|"
+                    + "com\\.android\\.systemui\\.subscreen\\.SubHomeActivity) ");
     private static final long MIN_RELAUNCH_MS = 1500; // stops a crash-looping launcher from spinning
     private static final long UNLOCK_DELAY_MS = 800; // let the wake/fold transition finish before checking
-    // Folded + awake + keyguard up: dismiss it. Only meaningful for a swipe-only lock; a PIN/pattern is untouched.
-    private static final String UNLOCK_IF_FOLDED =
-            "if dumpsys device_state | grep -q 'mCommittedState=.*name=.CLOSED'"
-                    + " && dumpsys power | grep -q 'mWakefulness=Awake'"
-                    + " && dumpsys window policy | grep -q '^ *showing=true';"
-                    + " then wm dismiss-keyguard; echo dismissed; fi";
+    private static final long HEALTH_INTERVAL_MS = 5000;
+    private static final String STATE_SNAPSHOT =
+            "dumpsys device_state; dumpsys power; dumpsys window policy; dumpsys activity activities";
+    private static final Pattern KEYGUARD_SHOWING = Pattern.compile("(?m)^ *showing=true *$");
+    private static final Pattern KEYGUARD_SWIPE_ONLY = Pattern.compile("(?m)^ *secure=false *$");
 
     private HandlerThread thread;
     private Handler worker;
@@ -51,7 +58,10 @@ public final class CoverService extends Service implements DisplayManager.Displa
     private volatile Process watcher;
     private long lastLaunch;
     private final AtomicBoolean callBusy = new AtomicBoolean();
-    private final Runnable unlockTask = this::unlockCover;
+    private final Runnable unlockTask = this::reconcileSafely;
+    private final AtomicBoolean healthBusy = new AtomicBoolean();
+    private final Runnable healthTask = this::checkHealth;
+    private AtomicFile heartbeat;
 
     @Override
     public void onCreate() {
@@ -77,6 +87,8 @@ public final class CoverService extends Service implements DisplayManager.Displa
 
         main.post(this::attachGestures);
         new Thread(this::watchStockHome, "cover-watcher").start();
+        heartbeat = new AtomicFile(new File(getFilesDir(), "heartbeat"));
+        main.post(healthTask);
     }
 
     @Override
@@ -88,6 +100,8 @@ public final class CoverService extends Service implements DisplayManager.Displa
     @Override
     public void onDestroy() {
         running = false;
+        main.removeCallbacks(healthTask);
+        worker.removeCallbacksAndMessages(null);
         Process p = watcher;
         if (p != null) p.destroy();
         dm.unregisterDisplayListener(this);
@@ -116,7 +130,7 @@ public final class CoverService extends Service implements DisplayManager.Displa
     }
 
     /**
-     * Blocks on the system event log. Event driven, no polling:
+     * Blocks on system events; the health tick also reconciles missed events and restart state.
      * <ul>
      * <li>Samsung's cover home became the top activity: start our launcher (an app in front is never disturbed).</li>
      * <li>Screen toggled or keyguard shown: if the phone is folded and awake, swipe the keyguard away.</li>
@@ -134,11 +148,18 @@ public final class CoverService extends Service implements DisplayManager.Displa
                     for (String line; running && (line = r.readLine()) != null; ) {
                         if (line.contains("wm_on_top_resumed_gained_called")) {
                             Matcher c = EVENT_COMPONENT.matcher(line);
-                            if (c.find() && c.group(1).equals(STOCK_HOME)) worker.post(this::showLauncher);
+                            if (c.find() && (c.group(1).equals(STOCK_HOME)
+                                    || c.group(1).equals(UsbDebugging.CLASS))) worker.post(this::reconcileSafely);
                         } else if (line.contains("wm_create_activity") || line.contains("wm_new_intent")) {
-                            // A call screen can start on the main display while it is asleep and never "resume" there.
                             Matcher c = COMPONENT_IN_EVENT.matcher(line);
-                            if (c.find() && CallAssist.CALL_ACTIVITY.matcher(c.group(1)).find()) pullCall(c.group(1));
+                            if (c.find()) {
+                                String cls = c.group(1);
+                                if (cls.equals(UsbDebugging.CLASS) || cls.equals(".usb.UsbDebuggingActivity")) {
+                                    worker.postDelayed(this::reconcileSafely, 200);
+                                } else if (CallAssist.CALL_ACTIVITY.matcher(cls).find()) {
+                                    pullCall(cls);
+                                }
+                            }
                         } else {
                             worker.removeCallbacks(unlockTask);
                             worker.postDelayed(unlockTask, UNLOCK_DELAY_MS);
@@ -174,25 +195,85 @@ public final class CoverService extends Service implements DisplayManager.Displa
         }, "call-assist").start();
     }
 
-    private void unlockCover() {
+    /** Only a responsive main loop, worker, root shell and event watcher publish health. */
+    private void checkHealth() {
+        if (!running) return;
+        if (healthBusy.compareAndSet(false, true)) {
+            worker.post(() -> {
+                try {
+                    reconcile();
+                    Process p = watcher;
+                    if (p != null && p.isAlive()) writeHeartbeat();
+                } catch (IOException e) {
+                    Log.e(TAG, "health check failed", e);
+                } finally {
+                    healthBusy.set(false);
+                }
+            });
+        }
+        main.postDelayed(healthTask, HEALTH_INTERVAL_MS);
+    }
+
+    private void writeHeartbeat() throws IOException {
+        FileOutputStream out = heartbeat.startWrite();
         try {
-            if (Root.run(UNLOCK_IF_FOLDED).contains("dismissed")) Log.i(TAG, "dismissed cover keyguard");
+            out.write((SystemClock.elapsedRealtime() / 1000 + "\n").getBytes(StandardCharsets.US_ASCII));
+            heartbeat.finishWrite(out);
         } catch (IOException e) {
-            Log.e(TAG, "unlock check failed", e);
+            heartbeat.failWrite(out);
+            throw e;
         }
     }
 
-    private void showLauncher() {
-        long now = System.currentTimeMillis();
-        if (now - lastLaunch < MIN_RELAUNCH_MS) return;
-        lastLaunch = now;
-        Log.i(TAG, "stock cover home is up, starting launcher");
+    private void reconcileSafely() {
         try {
-            Launch.root(new ComponentName(this, LauncherActivity.class), Launch.coverId());
-            main.postDelayed(this::attachGestures, 800); // the cover only becomes visible to us once we have a window on it
+            reconcile();
+        } catch (IOException e) {
+            Log.e(TAG, "cover reconciliation failed", e);
+        }
+    }
+
+    /** Reconcile existing state too, so restart or a missed log event cannot strand a dialog. */
+    private void reconcile() throws IOException {
+        String state = Root.run(STATE_SNAPSHOT);
+        if (!state.contains("mCommittedState=") || !state.contains("ACTIVITY MANAGER ACTIVITIES")) {
+            throw new IOException("incomplete cover state dump");
+        }
+        // Samsung's cover keyguard must be checked through its actual window policy.
+        // Only dismiss a swipe lock while folded and awake; never a PIN/pattern.
+        if (UsbDebugging.isFolded(state) && state.contains("mWakefulness=Awake")
+                && KEYGUARD_SHOWING.matcher(state).find()
+                && KEYGUARD_SWIPE_ONLY.matcher(state).find()) {
+            Root.run("wm dismiss-keyguard");
+            Log.i(TAG, "dismissed cover keyguard");
+        }
+        int coverId = Launch.coverId();
+        if (UsbDebugging.route(state, coverId)) return;
+        int start = state.indexOf("Display #" + coverId + " ");
+        if (start < 0) return;
+        int end = state.indexOf("\nDisplay #", start + 1);
+        Matcher home = TOP_STOCK_HOME.matcher(state);
+        home.region(start, end < 0 ? state.length() : end);
+        if (home.find()) launchLauncher(coverId);
+    }
+
+    private void showLauncher() {
+        try {
+            int coverId = Launch.coverId();
+            String state = Root.run("dumpsys device_state; dumpsys activity activities");
+            if (!UsbDebugging.route(state, coverId)) launchLauncher(coverId);
         } catch (IOException e) {
             Log.e(TAG, "showLauncher failed", e);
         }
+    }
+
+    private void launchLauncher(int coverId) throws IOException {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastLaunch < MIN_RELAUNCH_MS) return;
+        lastLaunch = now;
+        Log.i(TAG, "starting cover launcher");
+        Launch.root(new ComponentName(this, LauncherActivity.class), coverId);
+        main.postDelayed(this::attachGestures, 800);
     }
 
     private void attachGestures() {
