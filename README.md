@@ -22,13 +22,40 @@ Use the 512 × 260 cover display to launch apps, navigate with gestures, read no
 
 - **Tested device:** rooted Galaxy Z Flip3, SM_F711B, Android 15; physical cover display 512 × 260. Other models and firmware are unverified.
 - **Root:** Magisk with root access granted to `dev.vmn.coverlauncher`. The independent watchdog uses Magisk's `/data/adb/service.d` boot hook.
-- **Host tools:** Bash, JDK 17 or newer, Android SDK Platform Tools (`adb`), and `zip`.
-- **SDK packages:** Android platform 36 and Build Tools 36.0.0. The APK targets Android 15 (API 35) and has minimum API 31.
+- **Binary installation:** Bash and Android SDK Platform Tools (`adb`); `unzip` to extract the installer bundle.
+- **Building from source:** additionally, JDK 17 or newer, `zip`, Android platform 36 and Build Tools 36.0.0. The APK targets Android 15 (API 35) and has minimum API 31.
 - **ADB:** a working authorized USB or Wi-Fi connection for initial installation.
 
 The app requires overlay, notification, and notification-listener access. `install.sh` grants these and adds the package to the battery-optimization allowlist. Notification access lets the clock page display notification contents; root lets the app navigate, manage cover tasks, and force-stop cover apps.
 
-## Build and install
+## Install a release
+
+Download the **v0.1.0 pre-release** from [GitHub Releases](https://github.com/ChiThang-50Cent/cover-os/releases).
+It contains:
+
+- `CoverLauncher.apk`: version name `0.1.0`, version code `1`.
+- `cover-os-v0.1.0.zip`: the APK, `install.sh`, `root-watchdog.sh`, README and MIT license.
+- `SHA256SUMS`: checksums for the APK and installer bundle.
+
+For a complete installation with the independent root watchdog, extract the bundle into an empty
+directory and run its installer:
+
+```sh
+mkdir cover-os-v0.1.0
+unzip cover-os-v0.1.0.zip -d cover-os-v0.1.0
+cd cover-os-v0.1.0
+adb devices
+ANDROID_SERIAL=<device-serial-or-ip:port> ./install.sh
+```
+
+The bundle already contains `build/CoverLauncher.apk`; no JDK, Gradle or SDK build tools are required.
+Installing only the APK does not set up the watchdog or the permissions granted by the installer.
+
+Release APKs use the project's existing development signing key, preserving updates to the tested
+installation. The private keystore is never included in release assets. This pre-release has passed
+the documented E2E checks but has not undergone long-duration soak testing.
+
+## Build from source
 
 ```sh
 git clone https://github.com/ChiThang-50Cent/cover-os.git
